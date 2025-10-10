@@ -1,0 +1,109 @@
+name: Monitoring Health Check
+
+# Workflow desabilitado - descomente as linhas abaixo para reabilitar
+# on:
+#   schedule:
+#     - cron: '0 */6 * * *'
+#   workflow_dispatch:
+
+on:
+  workflow_dispatch:  # Permite execução manual apenas
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1
+      ECS_CLUSTER: kavoo-cluster
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Health check services (Target Group based)
+      run: |
+        set -euo pipefail
+
+        # Instalar jq se necessário
+        if ! command -v jq >/dev/null 2>&1; then
+          sudo apt-get update && sudo apt-get install -y jq
+        fi
+
+        echo "🏥 Verificando saúde via Target Groups (ELB), ignorando 'draining' e 'initial'"
+
+        SERVICES=("front" "admins-api" "checkout-api" "members-api" "users-api" "webhooks-api")
+        CLUSTER="${ECS_CLUSTER}"
+        FAIL=0
+        ATTEMPTS=12   # ~6 min (12 * 30s)
+        SLEEP=30
+
+        for svc in "${SERVICES[@]}"; do
+          ECS_SERVICE="kavoo-${svc}"
+          echo "\n== $ECS_SERVICE =="
+
+          SVC_JSON=$(aws ecs describe-services --cluster "$CLUSTER" --services "$ECS_SERVICE" --output json || echo '{}')
+          STATUS=$(echo "$SVC_JSON" | jq -r '.services[0].status // empty')
+          if [ -z "$STATUS" ] || [ "$STATUS" = "INACTIVE" ]; then
+            echo "❌ Serviço não encontrado ou INACTIVE"
+            FAIL=$((FAIL+1))
+            continue
+          fi
+
+          DESIRED=$(echo "$SVC_JSON" | jq -r '.services[0].desiredCount // 0')
+          TG_ARN=$(echo "$SVC_JSON" | jq -r '.services[0].loadBalancers[0].targetGroupArn // empty')
+          if [ -z "$TG_ARN" ] || [ "$TG_ARN" = "null" ]; then
+            echo "❌ Serviço sem Target Group associado"
+            FAIL=$((FAIL+1))
+            continue
+          fi
+
+          ok=0
+          for i in $(seq 1 $ATTEMPTS); do
+            STATES=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" --query 'TargetHealthDescriptions[*].TargetHealth.State' --output text || true)
+            HEALTHY_COUNT=0
+            if [ -n "$STATES" ]; then
+              for st in $STATES; do
+                case "$st" in
+                  healthy) HEALTHY_COUNT=$((HEALTHY_COUNT+1));;
+                  initial|draining) : ;; # ignorar
+                  *) : ;;
+                esac
+              done
+            fi
+
+            echo "Tentativa $i/$ATTEMPTS: healthy=$HEALTHY_COUNT desired=$DESIRED states=[$STATES]"
+            if [ "$HEALTHY_COUNT" -ge "$DESIRED" ] && [ "$DESIRED" -gt 0 ]; then
+              ok=1
+              break
+            fi
+            sleep $SLEEP
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "❌ Serviço $ECS_SERVICE não atingiu estado saudável"
+            FAIL=$((FAIL+1))
+          else
+            echo "✅ Serviço $ECS_SERVICE saudável"
+          fi
+        done
+
+        if [ $FAIL -ne 0 ]; then
+          echo "❌ $FAIL serviço(s) não saudável(is)"
+          exit 1
+        fi
+    
+    - name: Notify on failure
+      if: failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: 'Monitoring services are down',
+            body: 'Health check failed for monitoring services'
+          })

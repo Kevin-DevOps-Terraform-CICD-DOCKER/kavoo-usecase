@@ -1,0 +1,355 @@
+version: '3.8'
+
+x-common-variables: &common-variables
+  NODE_ENV: production
+  LOG_LEVEL: info
+
+x-common-deploy: &common-deploy
+  replicas: 2
+  update_config:
+    parallelism: 1
+    delay: 10s
+    failure_action: rollback
+    order: start-first
+  restart_policy:
+    condition: on-failure
+    delay: 5s
+    max_attempts: 3
+    window: 120s
+  resources:
+    limits:
+      cpus: '0.50'
+      memory: 512M
+    reservations:
+      cpus: '0.25'
+      memory: 256M
+
+x-api-base: &api-base
+  build:
+    dockerfile: Dockerfile
+  environment:
+    <<: *common-variables
+    AWS_DB_SECRET_ARN: ${AWS_DB_SECRET_ARN}
+    AWS_REDIS_SECRET_ARN: ${AWS_REDIS_SECRET_ARN}
+    REDIS_URL: ${REDIS_URL}
+    JWT_SECRET: ${JWT_SECRET}
+  depends_on:
+    - db
+    - redis
+  deploy:
+    <<: *common-deploy
+  networks:
+    - kavoo-networks
+  healthcheck:
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 40s
+
+services:
+  
+#Nginx Service
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/ssl/certs:ro
+      - nginx-logs:/var/log/nginx
+    depends_on:
+      - front
+      - admins-api
+      - checkout-api
+      - members-api
+      - users-api
+      - webhooks-api
+      - db
+      - redis
+    deploy:
+      <<: *common-deploy
+      placement:
+        constraints:
+          - node.role == manager
+    networks:
+      - kavoo-networks
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+#Frontend Service
+  front:
+    build:
+      context: ./apps/front
+    environment:
+      <<: *common-variables
+      API_BASE_URL: http://nginx
+      PORT: 3000
+    expose:
+      - 3000
+    deploy:
+      <<: *common-deploy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.front.rule=Host(`kavoo.com`)"
+        - "traefik.http.services.front.loadbalancer.server.port=3000"
+    networks:
+      - kavoo-networks
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+#Admins API Service
+  admins-api:
+    <<: *api-base
+    build:
+      context: ./apps/admins
+    environment:
+      <<: *common-variables
+      PORT: 8080
+      JWT_SECRET: ${JWT_SECRET}
+    expose:
+      - 8080
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+    deploy:
+      <<: *common-deploy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.admins-api.rule=Host(`admins.kavoo.com`)"
+        - "traefik.http.services.admins-api.loadbalancer.server.port=8080"
+
+#Checkout API Service
+  checkout-api:
+    <<: *api-base
+    build:
+      context: ./apps/checkout
+    environment:
+      <<: *common-variables
+      PORT: 8081
+      JWT_SECRET: ${JWT_SECRET}
+      PAYMENT_GATEWAY_URL: ${PAYMENT_GATEWAY_URL}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+    expose:
+      - 8081
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8081/health"]
+    deploy:
+      <<: *common-deploy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.checkout-api.rule=Host(`checkout.kavoo.com`)"
+        - "traefik.http.services.checkout-api.loadbalancer.server.port=8081"
+
+#Members API Service
+  members-api:
+    <<: *api-base
+    build:
+      context: ./apps/members
+    environment:
+      <<: *common-variables
+      PORT: 8082
+      JWT_SECRET: ${JWT_SECRET}
+    expose:
+      - 8082
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8082/health"]
+    deploy:
+      <<: *common-deploy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.members-api.rule=Host(`members.kavoo.com`)"
+        - "traefik.http.services.members-api.loadbalancer.server.port=8082"
+
+#Users API Service
+  users-api:
+    <<: *api-base
+    build:
+      context: ./apps/users
+    environment:
+      <<: *common-variables
+      PORT: 8083
+      JWT_SECRET: ${JWT_SECRET}
+      EMAIL_SERVICE_URL: ${EMAIL_SERVICE_URL}
+    expose:
+      - 8083
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8083/health"]
+    deploy:
+      <<: *common-deploy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.users-api.rule=Host(`users.kavoo.com`)"
+        - "traefik.http.services.users-api.loadbalancer.server.port=8083"
+
+#Webhooks API Service
+  webhooks-api:
+    <<: *api-base
+    build:
+      context: ./apps/webhooks
+    environment:
+      <<: *common-variables
+      PORT: 8084
+      JWT_SECRET: ${JWT_SECRET}
+      WEBHOOKS_SECRET: ${WEBHOOKS_SECRET}
+    expose:
+      - 8084
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8084/health"]
+    deploy:
+      <<: *common-deploy
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.webhooks-api.rule=Host(`webhooks.kavoo.com`)"
+        - "traefik.http.services.webhooks-api.loadbalancer.server.port=8084"
+
+#Database Service
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: kavoo
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_MULTIPLE_DATABASES: admins_db,checkout_db,members_db,users_db,webhooks_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init-multiple-databases.sh:/docker-entrypoint-initdb.d/init-multiple-databases.sh:ro
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    networks:
+      - kavoo-networks
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d kavoo_db"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+#Database backup Service
+  db-backup:
+    image: postgres:15-alpine
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./backups:/backups
+      - postgres-data:/var/lib/postgresql/data:ro
+    command: >
+      sh -c "
+        while true; do
+          pg_dump -h db -U ${POSTGRES_USER} kavoo_db > /backups/backup_$$(date +%Y%m%d_%H%M%S).sql
+          sleep 86400
+        done
+      "
+    depends_on:
+      - db
+    networks:
+      - kavoo-networks
+  
+#Cache - Redis
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 256M
+        reservations:
+          cpus: '0.10'
+          memory: 128M
+    networks:
+      - kavoo-networks
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+#Monitoring Service
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    networks:
+      - kavoo-networks
+
+#Metrics Visualization
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD} 
+    volumes:
+      - grafana-data:/var/lib/grafana
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    networks:
+      - kavoo-networks
+
+#Networks
+networks:
+  kavoo-networks:
+    driver: overlay
+    attachable: true
+
+#Volumes
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  nginx-logs:
+    driver: local

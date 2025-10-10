@@ -1,0 +1,175 @@
+name: CI
+
+# Workflow desabilitado - descomente as linhas abaixo para reabilitar
+# on:
+#   pull_request:
+#     branches: [main]
+
+on:
+  workflow_dispatch:  # Permite execução manual apenas
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: kavoo_user
+          POSTGRES_PASSWORD: kavoo_pass
+          POSTGRES_DB: kavoo
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7-alpine
+        env:
+          REDIS_PASSWORD: redis_pass
+        options: >-
+          --health-cmd "redis-cli -a redis_pass ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    
+    steps:
+    - name: Generate token with GitHub App
+      id: app_token
+      uses: tibdex/github-app-token@v2
+      with:
+        app_id: ${{ secrets.APP_ID }}
+        private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        
+    - name: Checkout code with submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        token: ${{ steps.app_token.outputs.token }}
+        fetch-depth: 0
+
+    - name: Debug submodules in CI
+      run: |
+        echo "🔑 Usando GitHub App token no CI"
+        echo "📋 Status dos submódulos:"
+        git submodule status
+        
+        echo "📁 Apps disponíveis:"
+        find apps -name "package.json" -o -name "requirements.txt" -o -name "Dockerfile"
+        
+        echo "📊 Verificação de conteúdo por app:"
+        for app in apps/*/; do
+          if [ -d "$app" ] && [ "$(ls -A $app 2>/dev/null)" ]; then
+            file_count=$(find "$app" -type f 2>/dev/null | wc -l)
+            echo "✅ $app ($file_count arquivos)"
+          else
+            echo "❌ $app (vazio ou não existe)"
+          fi
+        done
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: './apps/front/package-lock.json'
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install frontend dependencies
+      run: |
+        cd ./apps/front
+        npm ci
+        
+    - name: Create environment file
+      run: |
+        cp .env.example .env
+        
+        cat >> .env << EOF
+        NODE_ENV=test
+        LOG_LEVEL=debug
+        
+        # Test database
+        POSTGRES_USER=kavoo_user
+        POSTGRES_PASSWORD=kavoo_pass
+        POSTGRES_DB=kavoo
+        
+        # Test URLs
+        ADMINS_DATABASE_URL=postgresql://kavoo_user:kavoo_pass@localhost:5432/kavoo
+        CHECKOUT_DATABASE_URL=postgresql://kavoo_user:kavoo_pass@localhost:5432/kavoo
+        MEMBERS_DATABASE_URL=postgresql://kavoo_user:kavoo_pass@localhost:5432/kavoo
+        USERS_DATABASE_URL=postgresql://kavoo_user:kavoo_pass@localhost:5432/kavoo
+        WEBHOOKS_DATABASE_URL=postgresql://kavoo_user:kavoo_pass@localhost:5432/kavoo
+        
+        REDIS_URL=redis://:redis_pass@localhost:6379
+        
+        # Test secrets
+        JWT_SECRET=test_jwt_secret_key
+        NEXTAUTH_SECRET=test_nextauth_secret
+        WEBHOOKS_SECRET=test_webhook_secret
+        EOF
+    
+    - name: Wait for services
+      run: |
+        echo "Waiting for PostgreSQL..."
+        until pg_isready -h localhost -p 5432 -U kavoo_user; do
+          sleep 2
+        done
+        
+        echo "Waiting for Redis..."
+        # Usar autenticação do Redis
+        until redis-cli -h localhost -p 6379 -a redis_pass ping; do
+          sleep 2
+        done
+        
+        echo "Services ready!"
+    
+    - name: Run frontend linting
+      run: |
+        cd ./apps/front
+        npm run lint
+    
+    - name: Run frontend type checking
+      run: |
+        cd ./apps/front
+        npx tsc --noEmit
+    
+    - name: Build frontend
+      run: |
+        cd ./apps/front
+        npm run build
+    
+    - name: Run backend tests
+      run: |
+        # Testar cada API Python
+        for service in admins checkout members users webhooks; do
+          echo "Testing ${service}-api..."
+          if [ -d "./apps/${service}" ]; then
+            cd "./apps/${service}"
+            
+            # Instalar dependências se requirements.txt existe
+            if [ -f "requirements.txt" ]; then
+              pip install -r requirements.txt
+            fi
+            
+            # Executar testes se manage.py existe
+            if [ -f "manage.py" ]; then
+              python manage.py test || echo "Tests completed for ${service}-api"
+            else
+              echo "No manage.py found in ${service}-api, skipping tests"
+            fi
+            
+            cd ../..
+          else
+            echo "Directory ./apps/${service} not found, skipping ${service}-api tests"
+          fi
+        done

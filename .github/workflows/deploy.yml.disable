@@ -1,0 +1,947 @@
+name: Deploy to AWS ECS
+
+# Workflow desabilitado - descomente as linhas abaixo para reabilitar
+# on:
+#   push:
+#     branches: [main]
+
+on:
+  workflow_dispatch:  # Permite execução manual apenas
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+  ECS_CLUSTER: kavoo-cluster
+  TF_VERSION: "1.5.0"
+
+jobs:
+  infrastructure:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Generate token with GitHub App
+      id: app_token
+      uses: tibdex/github-app-token@v2
+      with:
+        app_id: ${{ secrets.APP_ID }}
+        private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        
+    - name: Checkout code with submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        token: ${{ steps.app_token.outputs.token }}
+        fetch-depth: 0
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Terraform Format Check
+      run: terraform fmt -check
+      continue-on-error: true
+    
+    - name: Terraform Init
+      run: terraform init
+    
+    - name: Terraform Validate
+      run: terraform validate
+    
+    - name: Check and prepare existing resources
+      run: |
+        echo "Analyzing existing AWS resources..."
+        
+        # Remover arquivo existente se houver
+        rm -f existing_resources.auto.tfvars
+        
+        # Criar arquivo de variáveis para recursos existentes
+        echo "# Auto-generated variables for existing resources - $(date)" > existing_resources.auto.tfvars
+        echo "" >> existing_resources.auto.tfvars
+        
+        # Estrutura correta da variável existing_resources
+        echo "existing_resources = {" >> existing_resources.auto.tfvars
+        
+        # Verificar ECR repositories com output melhorado
+        echo "  ecr_repositories = {" >> existing_resources.auto.tfvars
+        for service in front admins-api checkout-api members-api users-api webhooks-api; do
+          REPO_EXISTS=$(aws ecr describe-repositories --repository-names "kavoo/$service" --region ${{ env.AWS_REGION }} --query 'repositories[0].repositoryName' --output text 2>/dev/null || echo "NotFound")
+          if [ "$REPO_EXISTS" != "NotFound" ]; then
+            echo "    \"$service\" = true" >> existing_resources.auto.tfvars
+            echo "✓ ECR repository kavoo/$service exists"
+          else
+            echo "    \"$service\" = false" >> existing_resources.auto.tfvars
+            echo "✗ ECR repository kavoo/$service does not exist"
+          fi
+        done
+        echo "  }" >> existing_resources.auto.tfvars
+        
+        # Verificar VPC com lógica aprimorada
+        echo "  # VPC detection" >> existing_resources.auto.tfvars
+        
+        # Primeiro, verificar limite de VPCs
+        VPC_COUNT=$(aws ec2 describe-vpcs --query 'length(Vpcs)' --output text)
+        echo "Current VPC count: $VPC_COUNT"
+        
+        if [ "$VPC_COUNT" -ge 5 ]; then
+          echo "⚠️ VPC limit reached ($VPC_COUNT/5). Must use existing VPC."
+          
+          # Procurar por VPC kavoo-vpc primeiro
+          EXISTING_VPC=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=kavoo-vpc" --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          
+          if [ "$EXISTING_VPC" != "None" ] && [ "$EXISTING_VPC" != "null" ]; then
+            SUBNET_COUNT=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$EXISTING_VPC" --query 'length(Subnets)' --output text)
+            echo "Found kavoo-vpc: $EXISTING_VPC with $SUBNET_COUNT subnets"
+            
+            if [ "$SUBNET_COUNT" -ge 2 ]; then
+              echo "  vpc_exists = true" >> existing_resources.auto.tfvars
+              echo "  existing_vpc_id = \"$EXISTING_VPC\"" >> existing_resources.auto.tfvars
+              echo "✓ Using kavoo-vpc with sufficient subnets: $EXISTING_VPC"
+            else
+              echo "⚠️ kavoo-vpc has insufficient subnets. Creating subnets in existing VPC."
+              # Usar kavoo-vpc mesmo sem subnets - o Terraform criará subnets nela
+              echo "  vpc_exists = true" >> existing_resources.auto.tfvars
+              echo "  existing_vpc_id = \"$EXISTING_VPC\"" >> existing_resources.auto.tfvars
+              echo "✓ Will create subnets in existing kavoo-vpc: $EXISTING_VPC"
+            fi
+          else
+            # Procurar qualquer VPC com subnets suficientes
+            echo "Searching for any VPC with sufficient subnets..."
+            BEST_VPC_INFO=$(aws ec2 describe-vpcs --query 'Vpcs[*].[VpcId]' --output text | while read vpc_id; do
+              if [ -n "$vpc_id" ] && [ "$vpc_id" != "None" ]; then
+                SUBNET_COUNT=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$vpc_id" --query 'length(Subnets)' --output text 2>/dev/null || echo "0")
+                if [ "$SUBNET_COUNT" -ge 2 ]; then
+                  echo "$SUBNET_COUNT $vpc_id"
+                fi
+              fi
+            done | sort -nr | head -1)
+            
+            if [ -n "$BEST_VPC_INFO" ]; then
+              BEST_VPC=$(echo "$BEST_VPC_INFO" | cut -d' ' -f2)
+              SUBNET_COUNT=$(echo "$BEST_VPC_INFO" | cut -d' ' -f1)
+              echo "  vpc_exists = true" >> existing_resources.auto.tfvars
+              echo "  existing_vpc_id = \"$BEST_VPC\"" >> existing_resources.auto.tfvars
+              echo "✓ Using VPC with most subnets: $BEST_VPC ($SUBNET_COUNT subnets)"
+            else
+              # Usar a primeira VPC disponível - criar subnets nela
+              FIRST_VPC=$(aws ec2 describe-vpcs --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+              if [ "$FIRST_VPC" != "None" ] && [ "$FIRST_VPC" != "null" ]; then
+                echo "  vpc_exists = true" >> existing_resources.auto.tfvars
+                echo "  existing_vpc_id = \"$FIRST_VPC\"" >> existing_resources.auto.tfvars
+                echo "⚠️ Using first available VPC (will create subnets): $FIRST_VPC"
+              else
+                echo "ERROR: No VPCs found despite count being $VPC_COUNT"
+                exit 1
+              fi
+            fi
+          fi
+        else
+          # Pode criar nova VPC
+          EXISTING_VPC=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=kavoo-vpc" --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "None")
+          
+          if [ "$EXISTING_VPC" != "None" ] && [ "$EXISTING_VPC" != "null" ]; then
+            SUBNET_COUNT=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$EXISTING_VPC" --query 'length(Subnets)' --output text)
+            echo "  vpc_exists = true" >> existing_resources.auto.tfvars
+            echo "  existing_vpc_id = \"$EXISTING_VPC\"" >> existing_resources.auto.tfvars
+            echo "✓ Using existing kavoo-vpc: $EXISTING_VPC ($SUBNET_COUNT subnets)"
+          else
+            echo "  vpc_exists = false" >> existing_resources.auto.tfvars
+            echo "  existing_vpc_id = null" >> existing_resources.auto.tfvars
+            echo "✓ Will create new VPC (current count: $VPC_COUNT/5)"
+          fi
+        fi
+        
+        # Verificar secrets com verificação mais robusta e tratamento de erro
+        echo "  secrets = {" >> existing_resources.auto.tfvars
+        for secret in kavoo-redis-credentials kavoo-app-secrets; do
+          # Usar describe-secret com tratamento de erro mais robusto
+          if aws secretsmanager describe-secret --secret-id "$secret" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+            # Verificar se o secret tem uma versão válida
+            if aws secretsmanager get-secret-value --secret-id "$secret" --region ${{ env.AWS_REGION }} >/dev/null 2>&1; then
+              echo "    \"$secret\" = true" >> existing_resources.auto.tfvars
+              echo "✓ Secret $secret exists and has valid value"
+            else
+              echo "    \"$secret\" = false" >> existing_resources.auto.tfvars
+              echo "⚠️ Secret $secret exists but has no valid value - will recreate"
+            fi
+          else
+            echo "    \"$secret\" = false" >> existing_resources.auto.tfvars
+            echo "✗ Secret $secret does not exist"
+          fi
+        done
+        echo "  }" >> existing_resources.auto.tfvars
+        
+        # Verificar budget
+        BUDGET_EXISTS=$(aws budgets describe-budget --account-id ${{ secrets.AWS_ACCOUNT_ID }} --budget-name "kavoo-monthly-budget" --region us-east-1 --query 'Budget.BudgetName' --output text 2>/dev/null || echo "NotFound")
+        if [ "$BUDGET_EXISTS" != "NotFound" ]; then
+          echo "  budget_exists = true" >> existing_resources.auto.tfvars
+          echo "✓ Budget kavoo-monthly-budget exists"
+        else
+          echo "  budget_exists = false" >> existing_resources.auto.tfvars
+          echo "✗ Budget kavoo-monthly-budget does not exist"
+        fi
+        
+        # Fechar o objeto existing_resources
+        echo "}" >> existing_resources.auto.tfvars
+        echo "" >> existing_resources.auto.tfvars
+        
+        # Verificar ALB
+        ALB_EXISTS=$(aws elbv2 describe-load-balancers --names "kavoo-alb" --region ${{ env.AWS_REGION }} --query 'LoadBalancers[0].LoadBalancerName' --output text 2>/dev/null || echo "NotFound")
+        if [ "$ALB_EXISTS" != "NotFound" ]; then
+          echo "create_load_balancer = false" >> existing_resources.auto.tfvars
+          echo "create_target_groups = false" >> existing_resources.auto.tfvars
+          echo "✓ ALB and target groups exist - will use existing"
+        else
+          echo "create_load_balancer = true" >> existing_resources.auto.tfvars
+          echo "create_target_groups = true" >> existing_resources.auto.tfvars
+          echo "✗ ALB does not exist - will create new"
+        fi
+        
+        # Verificar se DB subnet groups já existem
+        DB_SUBNET_GROUP_EXISTS=$(aws rds describe-db-subnet-groups --db-subnet-group-name "kavoo-production-db-subnet-group" --region ${{ env.AWS_REGION }} --query 'DBSubnetGroups[0].DBSubnetGroupName' --output text 2>/dev/null || echo "NotFound")
+        if [ "$DB_SUBNET_GROUP_EXISTS" != "NotFound" ] && [ "$DB_SUBNET_GROUP_EXISTS" != "null" ]; then
+          echo "create_subnet_group = false" >> existing_resources.auto.tfvars
+          echo "✓ Using existing DB subnet group: $DB_SUBNET_GROUP_EXISTS"
+        else
+          echo "create_subnet_group = true" >> existing_resources.auto.tfvars
+          echo "✗ DB subnet group does not exist - will create new"
+        fi
+        
+        # Verificar se Cache subnet groups já existem
+        CACHE_SUBNET_GROUP_EXISTS=$(aws elasticache describe-cache-subnet-groups --cache-subnet-group-name "kavoo-production-cache-subnet-group" --region ${{ env.AWS_REGION }} --query 'CacheSubnetGroups[0].CacheSubnetGroupName' --output text 2>/dev/null || echo "NotFound")
+        if [ "$CACHE_SUBNET_GROUP_EXISTS" != "NotFound" ] && [ "$CACHE_SUBNET_GROUP_EXISTS" != "null" ]; then
+          echo "create_cache_subnet_group = false" >> existing_resources.auto.tfvars
+          echo "✓ Using existing Cache subnet group: $CACHE_SUBNET_GROUP_EXISTS"
+        else
+          echo "create_cache_subnet_group = true" >> existing_resources.auto.tfvars
+          echo "✗ Cache subnet group does not exist - will create new"
+        fi
+        
+        # Verificar Security Groups existentes
+        echo "create_security_groups = {" >> existing_resources.auto.tfvars
+        
+        # ALB Security Group
+        ALB_SG_EXISTS=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=kavoo-alb-*" --region ${{ env.AWS_REGION }} --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "NotFound")
+        if [ "$ALB_SG_EXISTS" != "NotFound" ] && [ "$ALB_SG_EXISTS" != "null" ]; then
+          echo "  alb = false" >> existing_resources.auto.tfvars
+          echo "✓ Using existing ALB Security Group: $ALB_SG_EXISTS"
+        else
+          echo "  alb = true" >> existing_resources.auto.tfvars
+          echo "✗ ALB Security Group does not exist - will create new"
+        fi
+        
+        # ECS Security Group
+        ECS_SG_EXISTS=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=kavoo-ecs-*" --region ${{ env.AWS_REGION }} --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "NotFound")
+        if [ "$ECS_SG_EXISTS" != "NotFound" ] && [ "$ECS_SG_EXISTS" != "null" ]; then
+          echo "  ecs = false" >> existing_resources.auto.tfvars
+          echo "✓ Using existing ECS Security Group: $ECS_SG_EXISTS"
+        else
+          echo "  ecs = true" >> existing_resources.auto.tfvars
+          echo "✗ ECS Security Group does not exist - will create new"
+        fi
+        
+        # Database Security Group
+        DB_SG_EXISTS=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=kavoo-database-*" --region ${{ env.AWS_REGION }} --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "NotFound")
+        if [ "$DB_SG_EXISTS" != "NotFound" ] && [ "$DB_SG_EXISTS" != "null" ]; then
+          echo "  database = false" >> existing_resources.auto.tfvars
+          echo "✓ Using existing Database Security Group: $DB_SG_EXISTS"
+        else
+          echo "  database = true" >> existing_resources.auto.tfvars
+          echo "✗ Database Security Group does not exist - will create new"
+        fi
+        
+        # Redis Security Group
+        REDIS_SG_EXISTS=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=kavoo-redis-*" --region ${{ env.AWS_REGION }} --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "NotFound")
+        if [ "$REDIS_SG_EXISTS" != "NotFound" ] && [ "$REDIS_SG_EXISTS" != "null" ]; then
+          echo "  redis = false" >> existing_resources.auto.tfvars
+          echo "✓ Using existing Redis Security Group: $REDIS_SG_EXISTS"
+        else
+          echo "  redis = true" >> existing_resources.auto.tfvars
+          echo "✗ Redis Security Group does not exist - will create new"
+        fi
+        
+        echo "}" >> existing_resources.auto.tfvars
+        
+        echo ""
+        echo "=== Generated existing_resources.auto.tfvars ==="
+        cat existing_resources.auto.tfvars
+        echo "==============================================="
+        echo ""
+        
+        # Validar que o arquivo foi criado corretamente
+        if [ ! -f "existing_resources.auto.tfvars" ]; then
+          echo "ERROR: existing_resources.auto.tfvars was not created"
+          exit 1
+        fi
+        
+        # Verificar se o arquivo contém as informações necessárias
+        if ! grep -q "existing_resources = {" existing_resources.auto.tfvars; then
+          echo "ERROR: existing_resources.auto.tfvars does not contain proper structure"
+          exit 1
+        fi
+        
+        echo "✓ Resource detection completed successfully"
+
+    - name: Prepare network configuration  
+      run: |
+        echo "🌐 Preparing correct network configuration for ECS services..."
+        
+        # Garantir que app.tfvars tenha as configurações corretas de rede
+        if ! grep -q "use_public_subnets_for_ecs" app.tfvars; then
+          echo "" >> app.tfvars
+          echo "# Network configuration to prevent Secrets Manager connectivity issues" >> app.tfvars
+          echo "use_public_subnets_for_ecs = true" >> app.tfvars
+          echo "ecs_assign_public_ip       = true" >> app.tfvars  
+          echo "force_network_fix          = true" >> app.tfvars
+          echo "✅ Network configuration added to app.tfvars"
+        else
+          echo "✅ Network configuration already exists in app.tfvars"
+        fi
+        
+        echo "Final app.tfvars network configuration:"
+        grep -A 5 -B 1 "use_public_subnets_for_ecs\|ecs_assign_public_ip\|force_network_fix" app.tfvars || echo "Configuration not found"
+
+    - name: Terraform Plan with resource existence handling
+      run: |
+        echo "Planning infrastructure deployment..."
+        
+        # Listar arquivos .tfvars disponíveis
+        echo "Available .tfvars files:"
+        ls -la *.tfvars || echo "No .tfvars files found"
+        
+        # Verificar conteúdo do arquivo auto-gerado
+        if [ -f "existing_resources.auto.tfvars" ]; then
+          echo "Content of existing_resources.auto.tfvars:"
+          cat existing_resources.auto.tfvars
+        else
+          echo "ERROR: existing_resources.auto.tfvars not found!"
+          exit 1
+        fi
+        
+        terraform plan -out=tfplan \
+          -var="certificate_arn=${{ secrets.AWS_CERTIFICATE_ARN }}" \
+          -var="stripe_secret_key=${{ secrets.STRIPE_SECRET_KEY }}" \
+          -var="postgres_version=14.12" \
+          -var-file="app.tfvars" \
+          -var-file="existing_resources.auto.tfvars"
+    
+    - name: Deploy infrastructure
+      run: |
+        echo "Applying infrastructure changes..."
+        
+        terraform apply -auto-approve tfplan
+        
+        echo "Infrastructure deployment completed successfully."
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+  analyze-services:
+    runs-on: ubuntu-latest
+    needs: infrastructure
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      services-matrix: ${{ steps.matrix.outputs.services-matrix }}
+      needs-deploy: ${{ steps.matrix.outputs.needs-deploy }}
+      deploy-count: ${{ steps.matrix.outputs.deploy-count }}
+      analysis-summary: ${{ steps.matrix.outputs.analysis-summary }}
+    
+    steps:
+    - name: Generate token with GitHub App
+      id: app_token
+      uses: tibdex/github-app-token@v2
+      with:
+        app_id: ${{ secrets.APP_ID }}
+        private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        
+    - name: Checkout code with submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        token: ${{ steps.app_token.outputs.token }}
+        fetch-depth: 0
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Analyze services for smart deploy
+      id: analyze
+      run: |
+        echo "🔍 Analisando quais serviços precisam de deploy..."
+        
+        # Torna scripts executáveis
+        chmod +x scripts/smart-deploy.sh
+        chmod +x scripts/check-image-health.sh
+        chmod +x scripts/generate-deploy-matrix.sh
+        
+        # Executa análise
+        ./scripts/smart-deploy.sh --analyze-only --output-file deploy-matrix.json
+        
+        # Mostra resultado da análise
+        echo "📊 Resultado da análise:"
+        cat deploy-matrix.json | jq '
+          "Resumo: " + 
+          (.summary.needs_deploy | tostring) + " serviços precisam de deploy, " + 
+          (.summary.already_healthy | tostring) + " já estão saudáveis"
+        '
+        
+        echo "📋 Detalhes:"
+        cat deploy-matrix.json | jq -r '
+          .services[] | 
+          if .needs_deploy then 
+            "  ⚡ " + .name + " → " + .reason 
+          else 
+            "  ✅ " + .name + " → " + .reason 
+          end
+        '
+    
+    - name: Generate deployment matrix
+      id: matrix
+      run: |
+        echo "🎯 Gerando matriz dinâmica para GitHub Actions..."
+        
+        # Gera outputs para GitHub Actions
+        ./scripts/generate-deploy-matrix.sh --format github >> $GITHUB_OUTPUT
+        
+        echo "✨ Matriz gerada com sucesso!"
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [infrastructure, analyze-services]
+    if: github.ref == 'refs/heads/main' && needs.analyze-services.outputs.needs-deploy == 'true'
+    
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.analyze-services.outputs.services-matrix) }}
+      fail-fast: false
+    
+    steps:
+    - name: Build Analysis Summary
+      run: |
+        echo "🔨 **SMART BUILD - SERVIÇO: ${{ matrix.service }}**"
+        echo "Total de serviços que precisam de deploy: ${{ needs.analyze-services.outputs.deploy-count }}"
+        echo "Razão para build deste serviço: Determinado pela análise smart-deploy"
+        echo ""
+    
+    - name: Generate token with GitHub App
+      id: app_token
+      uses: tibdex/github-app-token@v2
+      with:
+        app_id: ${{ secrets.APP_ID }}
+        private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        
+    - name: Checkout code with submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        token: ${{ steps.app_token.outputs.token }}
+        fetch-depth: 0
+
+    - name: Debug submodules status
+      run: |
+        echo "🔑 Usando GitHub App token"
+        echo "📋 Status dos submódulos:"
+        git submodule status
+        
+        echo "📁 Dockerfiles encontrados:"
+        find apps -name "Dockerfile" -type f
+        
+        echo "📂 Verificando conteúdo das apps:"
+        for app in apps/*/; do
+          if [ -d "$app" ] && [ "$(ls -A $app 2>/dev/null)" ]; then
+            echo "✅ $app (possui conteúdo)"
+            ls -la "$app" | head -3
+          else
+            echo "❌ $app (vazio ou não existe)"
+          fi
+          echo ""
+        done
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+    
+    - name: Build, tag, and push image to Amazon ECR
+      env:
+        ECR_REPOSITORY: kavoo/${{ matrix.service }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Determinar contexto de build baseado no serviço
+        case "${{ matrix.service }}" in
+          "front")
+            BUILD_CONTEXT="./apps/front"
+            ;;
+          "admins-api")
+            BUILD_CONTEXT="./apps/admins"
+            ;;
+          "checkout-api")
+            BUILD_CONTEXT="./apps/checkout"
+            ;;
+          "members-api")
+            BUILD_CONTEXT="./apps/members"
+            ;;
+          "users-api")
+            BUILD_CONTEXT="./apps/users"
+            ;;
+          "webhooks-api")
+            BUILD_CONTEXT="./apps/webhooks"
+            ;;
+          *)
+            echo "Unknown service: ${{ matrix.service }}"
+            exit 1
+            ;;
+        esac
+        
+        # Verificar se o contexto existe
+        if [ ! -d "$BUILD_CONTEXT" ]; then
+          echo "Build context directory does not exist: $BUILD_CONTEXT"
+          exit 1
+        fi
+        
+        echo "Building service: ${{ matrix.service }}"
+        echo "Build context: $BUILD_CONTEXT"
+        echo "ECR Registry: ${{ env.ECR_REGISTRY }}"
+        echo "ECR Repository: $ECR_REPOSITORY"
+        echo "Image Tag: $IMAGE_TAG"
+        
+        # Build da imagem com tag completa do ECR
+        docker build -t ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG $BUILD_CONTEXT
+        docker tag ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+        
+        # Push para ECR
+        docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:$IMAGE_TAG
+        docker push ${{ env.ECR_REGISTRY }}/$ECR_REPOSITORY:latest
+        
+        echo "Successfully pushed ${{ matrix.service }} to ECR"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [build-and-push, analyze-services]
+    if: github.ref == 'refs/heads/main' && needs.analyze-services.outputs.needs-deploy == 'true'
+    
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.analyze-services.outputs.services-matrix) }}
+      fail-fast: false
+    
+    steps:
+    - name: Deploy Analysis Summary
+      run: |
+        echo "🚀 **SMART DEPLOY - SERVIÇO: ${{ matrix.service }}**"
+        echo "Total de serviços deployados: ${{ needs.analyze-services.outputs.deploy-count }}"
+        echo "Este serviço foi selecionado pela análise inteligente"
+        echo ""
+    
+    - name: Generate token with GitHub App
+      id: app_token
+      uses: tibdex/github-app-token@v2
+      with:
+        app_id: ${{ secrets.APP_ID }}
+        private_key: ${{ secrets.APP_PRIVATE_KEY }}
+        
+    - name: Checkout code with submodules
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        token: ${{ steps.app_token.outputs.token }}
+        fetch-depth: 0
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Check and fix network configuration
+      env:
+        ECS_SERVICE: kavoo-${{ matrix.service }}
+      run: |
+        echo "🔍 Checking network configuration for $ECS_SERVICE..."
+        
+        # Verificar se o serviço existe e sua configuração de rede
+        if aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services $ECS_SERVICE \
+            --query 'services[0]' > /dev/null 2>&1; then
+          
+          # Obter configuração atual
+          ASSIGN_PUBLIC_IP=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services $ECS_SERVICE \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration.assignPublicIp' \
+            --output text 2>/dev/null || echo "DISABLED")
+          
+          echo "Current assignPublicIp setting: $ASSIGN_PUBLIC_IP"
+          
+          # Se estiver desabilitado, aplicar correção preventiva
+          if [[ "$ASSIGN_PUBLIC_IP" == "DISABLED" ]]; then
+            echo "⚠️ Service using private subnets - applying network fix to prevent Secrets Manager errors"
+            
+            # Usar script de correção
+            chmod +x ./scripts/smart-deploy.sh
+            if ./scripts/smart-deploy.sh --fix-network --dry-run; then
+              echo "✅ Applying network configuration fix..."
+              ./scripts/smart-deploy.sh --fix-network
+            else
+              echo "⚠️ Unable to auto-fix - deploy may encounter ResourceInitializationError"
+            fi
+          else
+            echo "✅ Network configuration looks good"
+          fi
+        else
+          echo "ℹ️ Service does not exist yet - will be created with correct configuration"
+        fi
+
+    - name: Update ECS service  
+      env:
+        ECS_SERVICE: kavoo-${{ matrix.service }}
+        ECR_REPOSITORY: kavoo/${{ matrix.service }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        set -e
+
+        # Instalar jq se necessário
+        if ! command -v jq &> /dev/null; then
+          sudo apt-get update && sudo apt-get install -y jq
+        fi
+
+        # Verificar se a tag da imagem existe no ECR; fallback para latest
+        echo "Checking ECR tag existence for $ECR_REPOSITORY:$IMAGE_TAG"
+        if ! aws ecr describe-images \
+          --repository-name "$ECR_REPOSITORY" \
+          --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+          echo "⚠️ Tag $IMAGE_TAG não existe no ECR. Usando fallback: latest"
+          IMAGE_TAG="latest"
+        fi
+
+        # Verificar se o serviço ECS existe
+        echo "Checking if ECS service $ECS_SERVICE exists in cluster ${{ env.ECS_CLUSTER }}"
+        SERVICE_EXISTS=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services $ECS_SERVICE \
+          --query 'length(services[?status==`ACTIVE`])' \
+          --output text 2>/dev/null || echo "0")
+        if [ "$SERVICE_EXISTS" = "0" ]; then
+          echo "ECS service $ECS_SERVICE not found or not active in cluster ${{ env.ECS_CLUSTER }}"
+          exit 1
+        fi
+        echo "ECS service $ECS_SERVICE found and active"
+
+        # Obter nome da TD atual vinculada ao serviço
+        TASK_DEF_NAME=$(aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services $ECS_SERVICE \
+          --query 'services[0].taskDefinition' \
+          --output text | awk -F'/' '{print $NF}' | awk -F':' '{print $1}')
+        
+        # Obter task definition
+        echo "Getting current task definition for $TASK_DEF_NAME"
+        TASK_DEFINITION=$(aws ecs describe-task-definition \
+          --task-definition "$TASK_DEF_NAME" \
+          --query taskDefinition \
+          --output json)
+        if [ -z "$TASK_DEFINITION" ] || [ "$TASK_DEFINITION" = "null" ]; then
+          echo "Failed to get task definition for $TASK_DEF_NAME"
+          exit 1
+        fi
+
+        TEMP_FILE=$(mktemp)
+        ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }}
+        EXEC_ARN="arn:aws:iam::${ACCOUNT_ID}:role/kavoo-ecs-execution-role"
+        IMAGE_URI="${{ env.ECR_REGISTRY }}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+        echo "Updating task definition image to $IMAGE_URI and ensuring executionRoleArn"
+        echo "$TASK_DEFINITION" | jq --arg IMAGE_URI "$IMAGE_URI" --arg EXEC_ARN "$EXEC_ARN" '
+           .containerDefinitions[0].image = $IMAGE_URI
+         | if (.executionRoleArn == null or .executionRoleArn == "") then
+             .executionRoleArn = $EXEC_ARN
+           else . end
+         | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)
+        ' > "$TEMP_FILE"
+
+        # Validar JSON antes de enviar
+        jq . "$TEMP_FILE" >/dev/null
+
+        echo "Registering new task definition..."
+        NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+          --cli-input-json "file://$TEMP_FILE" \
+          --query taskDefinition.taskDefinitionArn \
+          --output text)
+        rm -f "$TEMP_FILE"
+
+        if [ -z "$NEW_TASK_DEF_ARN" ] || [ "$NEW_TASK_DEF_ARN" = "null" ]; then
+          echo "Failed to register new task definition"
+          exit 1
+        fi
+        echo "Registered new task definition: $NEW_TASK_DEF_ARN"
+
+        echo "Updating ECS service $ECS_SERVICE..."
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service $ECS_SERVICE \
+          --task-definition $NEW_TASK_DEF_ARN \
+          --force-new-deployment \
+          --no-cli-pager
+        echo "Updated ECS service $ECS_SERVICE with new task definition"
+
+        echo "Waiting for deployment to complete (max 15 minutes)..."
+        export AWS_MAX_ATTEMPTS=30
+        export AWS_RETRY_DELAY=30
+        timeout 900 aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services $ECS_SERVICE || true
+
+        # Status pós-wait
+        aws ecs describe-services \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services $ECS_SERVICE \
+          --query 'services[0].{Status:status,RunningCount:runningCount,DesiredCount:desiredCount,AssignPublicIp:networkConfiguration.awsvpcConfiguration.assignPublicIp}' \
+          --output table
+
+    - name: Check and fix network configuration
+      env:
+        ECS_SERVICE: kavoo-${{ matrix.service }}
+      run: |
+        echo "🔍 Checking network configuration for $ECS_SERVICE..."
+        
+        # Aguardar um pouco para que o deployment se estabilize
+        sleep 10
+        
+        # Verificar configuração atual de rede
+        if aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services $ECS_SERVICE \
+            --query 'services[0]' > /dev/null 2>&1; then
+          
+          # Obter configuração atual
+          echo "Getting current network configuration..."
+          NETWORK_CONFIG=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services $ECS_SERVICE \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration' \
+            --output json 2>/dev/null || echo "{}")
+          
+          if [[ "$NETWORK_CONFIG" != "{}" ]]; then
+            ASSIGN_PUBLIC_IP=$(echo "$NETWORK_CONFIG" | jq -r '.assignPublicIp // "DISABLED"')
+            SUBNETS=$(echo "$NETWORK_CONFIG" | jq -r '.subnets[]' | head -1)
+            
+            echo "Current network configuration:"
+            echo "  assignPublicIp: $ASSIGN_PUBLIC_IP"
+            echo "  First subnet: $SUBNETS"
+            
+            # Verificar se configuração está correta
+            if [[ "$ASSIGN_PUBLIC_IP" == "ENABLED" ]]; then
+              echo "✅ Network configuration is correct - service can access Secrets Manager"
+              echo "✅ No ResourceInitializationError should occur"
+            else
+              echo "⚠️  WARNING: Service has assignPublicIp=DISABLED"
+              echo "This can cause ResourceInitializationError with Secrets Manager"
+              
+              # Tentar aplicar correção automática
+              echo ""
+              echo "🔧 Attempting automatic network fix..."
+              chmod +x ./scripts/smart-deploy.sh
+              
+              if ./scripts/smart-deploy.sh --fix-network 2>/dev/null; then
+                echo "✅ Network configuration fixed successfully"
+                
+                # Aguardar propagação da mudança
+                echo "Waiting for configuration to propagate..."
+                sleep 30
+                
+                # Verificar novamente
+                NEW_CONFIG=$(aws ecs describe-services \
+                  --cluster ${{ env.ECS_CLUSTER }} \
+                  --services $ECS_SERVICE \
+                  --query 'services[0].networkConfiguration.awsvpcConfiguration.assignPublicIp' \
+                  --output text 2>/dev/null)
+                
+                if [[ "$NEW_CONFIG" == "ENABLED" ]]; then
+                  echo "✅ Network fix confirmed - service now has correct configuration"
+                else
+                  echo "⚠️  Network fix may not have taken effect yet - monitor deployment"
+                fi
+              else
+                echo "❌ Failed to fix network configuration automatically"
+                echo ""
+                echo "💡 Manual steps to fix:"
+                echo "   1. Run: ./scripts/smart-deploy.sh --fix-network"
+                echo "   2. Or update Terraform to use public subnets with assignPublicIp=true"
+                echo "   3. Ensure security groups allow HTTPS outbound (port 443)"
+                echo ""
+                echo "⚠️  Deploy may experience connectivity issues until fixed"
+              fi
+            fi
+          else
+            echo "⚠️  Unable to retrieve network configuration"
+            echo "Service may not exist or be accessible"
+          fi
+        else
+          echo "ℹ️  Service $ECS_SERVICE not found"
+          echo "This is normal for new deployments created with correct configuration"
+        fi
+
+  health-check:
+    runs-on: ubuntu-latest
+    needs: [deploy, analyze-services]
+    if: github.ref == 'refs/heads/main' && needs.analyze-services.outputs.needs-deploy == 'true'
+    
+    steps:
+    - name: Health Check Summary
+      run: |
+        echo "🏥 **SMART HEALTH CHECK**"
+        echo "Verificando saúde de ${{ needs.analyze-services.outputs.deploy-count }} serviços deployados"
+        echo "Serviços processados pela análise inteligente"
+        echo ""
+    
+    - name: Wait for services to stabilize
+      run: sleep 90
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Get ALB DNS name
+      id: get-alb
+      run: |
+        ALB_DNS=$(aws elbv2 describe-load-balancers \
+          --names kavoo-alb \
+          --query 'LoadBalancers[0].DNSName' \
+          --output text)
+        
+        if [ "$ALB_DNS" = "None" ] || [ -z "$ALB_DNS" ]; then
+          echo "ALB not found or not ready"
+          exit 1
+        fi
+        
+        echo "alb-dns=$ALB_DNS" >> $GITHUB_OUTPUT
+        echo "ALB DNS: $ALB_DNS"
+    
+    - name: Health check services (Target Group based)
+      run: |
+        set -euo pipefail
+        echo "Validando saúde via Target Group (ELB) ignorando 'draining' e 'initial'"
+
+        SERVICES=("front" "admins-api" "checkout-api" "members-api" "users-api" "webhooks-api")
+        CLUSTER="${{ env.ECS_CLUSTER }}"
+        FAIL=0
+        ATTEMPTS=12   # ~6 min (12 * 30s)
+        SLEEP=30
+
+        for svc in "${SERVICES[@]}"; do
+          ECS_SERVICE="kavoo-${svc}"
+          echo "▶ $ECS_SERVICE"
+
+          TG_ARN=$(aws ecs describe-services --cluster "$CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].loadBalancers[0].targetGroupArn' --output text)
+
+          if [ "$TG_ARN" = "None" ] || [ -z "$TG_ARN" ]; then
+            echo "  ❌ Sem Target Group vinculado"
+            FAIL=1
+            continue
+          fi
+
+          DESIRED=$(aws ecs describe-services --cluster "$CLUSTER" --services "$ECS_SERVICE" \
+            --query 'services[0].desiredCount' --output text)
+
+          ok=0
+          for ((i=1;i<=ATTEMPTS;i++)); do
+            STATES_JSON=$(aws elbv2 describe-target-health --target-group-arn "$TG_ARN" \
+              --query 'TargetHealthDescriptions[].TargetHealth.State' --output json || echo "[]")
+
+            HEALTHY=$(echo "$STATES_JSON" | jq -r '[.[] | select(.=="healthy")] | length')
+            UNHEALTHY=$(echo "$STATES_JSON" | jq -r '[.[] | select(.=="unhealthy")] | length')
+            DRAINING=$(echo "$STATES_JSON" | jq -r '[.[] | select(.=="draining")] | length')
+            INITIAL=$(echo "$STATES_JSON" | jq -r '[.[] | select(.=="initial")] | length')
+
+            echo "  Attempt $i/$ATTEMPTS → healthy=$HEALTHY unhealthy=$UNHEALTHY draining=$DRAINING initial=$INITIAL desired=$DESIRED"
+
+            # Aprova quando há saudáveis suficientes; ignora draining/initial
+            if [ "$HEALTHY" -ge "$DESIRED" ]; then
+              echo "  ✅ Healthy (>= desired)"
+              ok=1
+              break
+            fi
+
+            sleep "$SLEEP"
+          done
+
+          if [ $ok -eq 0 ]; then
+            echo "  ❌ Não atingiu healthy >= desired após $((ATTEMPTS*SLEEP))s"
+            FAIL=1
+          fi
+        done
+
+        if [ $FAIL -ne 0 ]; then
+          echo "❌ Alguns serviços não atingiram o estado saudável esperado"
+          exit 1
+        fi
+
+  notify:
+    runs-on: ubuntu-latest
+    needs: [infrastructure, analyze-services, deploy, health-check]
+    if: always()
+    
+    steps:
+    - name: Notify deployment success
+      if: needs.infrastructure.result == 'success' && needs.deploy.result == 'success' && needs.health-check.result == 'success'
+      run: |
+        echo "🎉 **SMART DEPLOY SUCCESSFUL!**"
+        echo ""
+        echo "✅ Infrastructure deployed successfully"
+        echo "🧠 Smart analysis completed - ${{ needs.analyze-services.outputs.deploy-count }} services processed"
+        echo "🚀 Only necessary services were built and deployed"
+        echo "🏥 Health checks passed for all deployed services"
+        echo "Health checks passed"
+        echo "Application is live on AWS"
+        echo ""
+        echo "Deployment ID: ${{ github.run_id }}"
+        echo "Commit: ${{ github.sha }}"
+        echo "Repository: ${{ github.repository }}"
+    
+    - name: Notify deployment failure
+      if: needs.infrastructure.result == 'failure' || needs.deploy.result == 'failure' || needs.health-check.result == 'failure'
+      run: |
+        echo "❌ **SMART DEPLOY FAILED!**"
+        echo ""
+        echo "📊 Analysis Results:"
+        echo "  Services analyzed: ${{ needs.analyze-services.outputs.deploy-count || 'N/A' }}"
+        echo "  Analysis status: ${{ needs.analyze-services.result || 'N/A' }}"
+        echo ""
+        echo "🔧 Job Results:"
+        echo "  Infrastructure: ${{ needs.infrastructure.result }}"
+        echo "  Deploy: ${{ needs.deploy.result }}"
+        echo "  Health Check: ${{ needs.health-check.result }}"
+        echo ""
+        echo "Failed Deployment ID: ${{ github.run_id }}"
+        echo "Commit: ${{ github.sha }}"
+        echo "Repository: ${{ github.repository }}"
+        echo ""
+        echo "Check the workflow logs for detailed error information:"
+        echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        
+        # Exit with error to mark the step as failed
+        exit 1
