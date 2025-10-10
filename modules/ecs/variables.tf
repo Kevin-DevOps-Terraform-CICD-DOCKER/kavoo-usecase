@@ -1,3 +1,6 @@
+# Nome do projeto para padronização de recursos
+# Função: Fornecer prefixo único para todos os recursos criados
+# Usado por: locals, resources e outputs para nomenclatura consistente
 variable "project_name" {
   description = "Project name"
   type        = string
@@ -18,6 +21,9 @@ variable "domain_name" {
   type        = string
 }
 
+# Configurações de todos os serviços a serem deployados
+# Função: Definir recursos e configurações específicas para cada serviço/container
+# Usado por: aws_ecs_task_definition, aws_ecs_service, aws_cloudwatch_log_group para criar recursos por serviço
 variable "services" {
   description = "Map of service configurations"
   type = map(object({
@@ -63,6 +69,9 @@ variable "redis_endpoint" {
   type        = string
 }
 
+# ARNs dos secrets AWS Secrets Manager para injeção nos containers
+# Função: Fornecer credenciais seguras (DB, Redis) para os containers via environment secrets
+# Usado por: aws_ecs_task_definition para configurar secrets nos container definitions
 variable "secrets_arns" {
   description = "Map of secret ARNs"
   type = object({
@@ -87,11 +96,17 @@ variable "alb_listener" {
   type        = any
 }
 
+# URI da imagem Docker do frontend no ECR
+# Função: Especificar qual imagem Docker usar para o container do frontend
+# Usado por: aws_ecs_task_definition para definir a imagem do container "front"
 variable "frontend_image_uri" {
   description = "Frontend container image URI"
   type        = string
 }
 
+# Map de URIs das imagens Docker das APIs no ECR
+# Função: Especificar qual imagem Docker usar para cada container de API
+# Usado por: aws_ecs_task_definition para definir imagens dos containers de API
 variable "api_image_uris" {
   description = "Map of API container image URIs"
   type        = map(string)
@@ -155,6 +170,9 @@ variable "log_level" {
   }
 }
 
+# Controle manual para usar cluster ECS existente
+# Função: Permitir override da descoberta automática de cluster existente
+# Usado por: locals.should_use_existing_cluster para decisão final sobre criação/reutilização
 variable "use_existing_cluster" {
   description = "Use existing ECS cluster instead of creating a new one (null = auto-discover)"
   type        = bool
@@ -214,6 +232,9 @@ variable "ecs_assign_public_ip" {
   default     = true
 }
 
+# Forçar uso de subnets públicas com IP público para todos os serviços
+# Função: Contornar problemas de conectividade evitando NAT Gateway e garantindo acesso a serviços AWS
+# Usado por: aws_ecs_service network_configuration para definir subnets e assign_public_ip
 variable "force_network_fix" {
   description = "Force network configuration to use public subnets with public IP for all services"
   type        = bool

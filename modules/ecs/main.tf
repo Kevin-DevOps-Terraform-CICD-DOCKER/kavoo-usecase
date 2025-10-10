@@ -1,16 +1,21 @@
+# Obtém informações da conta AWS atual (Account ID)
+# Função: Fornecer dados da conta AWS para construir ARNs de recursos
+# Usa: Nenhuma variável específica
+# Usado por: locals para construir ARNs de cluster e execution role
 data "aws_caller_identity" "current" {}
 
+# Define nomes padronizados para recursos ECS
+# Função: Padronizar nomenclatura de recursos baseada no nome do projeto
+# Usa: var.project_name para criar nomes únicos
+# Usado por: todos os recursos ECS e IAM do módulo
 locals {
   cluster_name = "${var.project_name}-cluster"
   role_name    = "${var.project_name}-ecs-execution-role"
 }
-
-# Data sources condicionais baseados apenas nos external data providers
-
-# Auto-discovery segura para todos os recursos
-# Primeiro, tentamos descobrir quais recursos realmente existem
-
-# Scripts otimizados para descoberta segura e rápida
+# Verifica se cluster ECS já existe na AWS
+# Função: Auto-descobrir cluster existente para evitar duplicação de recursos
+# Usa: var.aws_region, local.cluster_name
+# Usado por: locals para decidir se deve criar ou usar cluster existente
 data "external" "cluster_discovery" {
   program = [
     "bash", "-c",
@@ -18,14 +23,20 @@ data "external" "cluster_discovery" {
   ]
 }
 
+# Verifica se role de execução ECS já existe no IAM
+# Função: Auto-descobrir execution role existente para evitar duplicação de recursos
+# Usa: var.aws_region, local.role_name
+# Usado por: locals para decidir se deve criar ou usar execution role existente
 data "external" "execution_role_discovery" {
   program = [
     "bash", "-c",
     "aws --region ${var.aws_region} iam get-role --role-name '${local.role_name}' --query 'Role.RoleName' --output text >/dev/null 2>&1 && echo '{\"exists\":\"true\"}' || echo '{\"exists\":\"false\"}'"
   ]
 }
-
-# Discovery real para serviços, task definitions e log groups
+# Verifica se serviços ECS já existem no cluster
+# Função: Auto-descobrir serviços ECS existentes para cada service configurado
+# Usa: var.services, var.aws_region, var.project_name, local.cluster_name
+# Usado por: locals para decidir se deve criar ou usar serviços existentes
 data "external" "services_discovery" {
   for_each = var.services
   program = [
@@ -34,6 +45,10 @@ data "external" "services_discovery" {
   ]
 }
 
+# Verifica se task definitions ECS já existem
+# Função: Auto-descobrir task definitions existentes para cada serviço
+# Usa: var.services, var.aws_region, var.project_name
+# Usado por: locals para decidir se deve criar ou usar task definitions existentes
 data "external" "task_definitions_discovery" {
   for_each = var.services
   program = [
@@ -42,6 +57,10 @@ data "external" "task_definitions_discovery" {
   ]
 }
 
+# Verifica se log groups CloudWatch já existem
+# Função: Auto-descobrir log groups existentes para cada serviço
+# Usa: var.services, var.aws_region, var.project_name
+# Usado por: locals para decidir se deve criar ou usar log groups existentes
 data "external" "log_groups_discovery" {
   for_each = var.services
   program = [
@@ -49,13 +68,11 @@ data "external" "log_groups_discovery" {
     "aws --region ${var.aws_region} logs describe-log-groups --log-group-name-prefix '/ecs/${var.project_name}/${each.key}' --query 'length(logGroups[?logGroupName==`/ecs/${var.project_name}/${each.key}`])' --output text 2>/dev/null | grep -q '^[1-9]' && echo '{\"exists\":\"true\"}' || echo '{\"exists\":\"false\"}'"
   ]
 }
-
-# Removendo data sources que causam dependências circulares
-# Toda a lógica de descoberta será feita através dos external data providers
-
-# Locals com lógica simplificada de uso de recursos existentes vs criação de novos
+# Processa resultados de descoberta automática e define estratégia de recursos
+# Função: Decidir se usar recursos existentes ou criar novos baseado em descoberta automática e configurações manuais
+# Usa: data.external discovery results, var.use_existing_*, var.services
+# Usado por: recursos ECS para determinar count e referências
 locals {
-  # Auto-discovery baseado em external data providers (mais confiável)
   cluster_discovered        = data.external.cluster_discovery.result["exists"] == "true"
   execution_role_discovered = data.external.execution_role_discovery.result["exists"] == "true"
 
@@ -69,7 +86,6 @@ locals {
     for k, v in var.services : k => data.external.task_definitions_discovery[k].result["exists"] == "true"
   }
 
-  # Lógica final: prioridade para configuração explícita, depois auto-discovery
   should_use_existing_cluster        = var.use_existing_cluster != null ? var.use_existing_cluster : local.cluster_discovered
   should_use_existing_execution_role = var.use_existing_execution_role != null ? var.use_existing_execution_role : local.execution_role_discovered
 
@@ -83,7 +99,6 @@ locals {
     for k, v in var.services : k => lookup(var.use_existing_task_definitions, k, local.task_definitions_discovered[k])
   }
 
-  # Debug info para transparência
   resource_strategy_debug = {
     cluster        = local.should_use_existing_cluster ? "using-existing" : "creating-new"
     execution_role = local.should_use_existing_execution_role ? "using-existing" : "creating-new"
@@ -106,6 +121,10 @@ locals {
   }
 }
 
+# Cria cluster ECS se não existir
+# Função: Provisionar cluster ECS com Container Insights habilitado para monitoramento
+# Usa: local.should_use_existing_cluster, local.cluster_name, var.project_name, var.environment
+# Usado por: locals.cluster_arn e aws_ecs_service para referenciar o cluster
 resource "aws_ecs_cluster" "main" {
   count = local.should_use_existing_cluster ? 0 : 1
   name  = local.cluster_name
@@ -121,6 +140,10 @@ resource "aws_ecs_cluster" "main" {
     Project     = var.project_name
   }
 }
+# Cria role IAM para execução de tarefas ECS se não existir
+# Função: Provisionar role IAM que permite ao ECS assumir e executar tarefas
+# Usa: local.should_use_existing_execution_role, local.role_name, var.project_name, var.environment
+# Usado por: aws_ecs_task_definition para execution_role_arn e aws_iam_role_policy para anexar políticas
 resource "aws_iam_role" "ecs_execution_role" {
   count = local.should_use_existing_execution_role ? 0 : 1
   name  = local.role_name
@@ -145,7 +168,10 @@ resource "aws_iam_role" "ecs_execution_role" {
   }
 }
 
-# ARNs construídos dinamicamente baseado apenas na external discovery
+# Define ARNs e nomes de recursos baseado na estratégia de uso (existente ou novo)
+# Função: Fornecer ARNs consistentes independente se recurso é existente ou novo
+# Usa: local.should_use_existing_*, data.aws_caller_identity, var.aws_region, aws_ecs_cluster, aws_iam_role
+# Usado por: aws_ecs_service, aws_ecs_task_definition, outputs
 locals {
   cluster_arn = local.should_use_existing_cluster ? "arn:aws:ecs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:cluster/${local.cluster_name}" : (length(aws_ecs_cluster.main) > 0 ? aws_ecs_cluster.main[0].arn : "")
 
@@ -154,17 +180,19 @@ locals {
   execution_role_name = local.should_use_existing_execution_role ? local.role_name : (length(aws_iam_role.ecs_execution_role) > 0 ? aws_iam_role.ecs_execution_role[0].name : local.role_name)
 }
 
-# Policy attachment sempre aplicado (usa role existente ou novo)
+# Anexa política AWS gerenciada para execução de tarefas ECS
+# Função: Fornecer permissões básicas para ECS (ECR, CloudWatch Logs)
+# Usa: local.execution_role_name
+# Usado por: aws_ecs_service como dependência para garantir permissões antes da criação
 resource "aws_iam_role_policy_attachment" "ecs_execution_role_policy" {
   role       = local.execution_role_name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Policy de secrets sempre aplicada (usa role existente ou novo)
-# Implementa lógica "se existir usar, senão criar" para policies também
-# CORREÇÃO: Usa apenas wildcard para evitar conflitos com sufixos de ARN dos secrets
-# Problema resolvido: ARNs específicos sem sufixo (ex: kavoo-admins-api-db-credentials) 
-# não funcionavam com ARNs reais que têm sufixo (ex: kavoo-admins-api-db-credentials-6Fmspt)
+# Cria política IAM para acesso ao AWS Secrets Manager
+# Função: Permitir que tarefas ECS acessem secrets específicos do projeto
+# Usa: var.project_name, local.execution_role_name, var.aws_region
+# Usado por: aws_ecs_service como dependência para garantir acesso aos secrets
 resource "aws_iam_role_policy" "secrets_policy" {
   name = "${var.project_name}-ecs-secrets-policy"
   role = local.execution_role_name
@@ -192,12 +220,14 @@ resource "aws_iam_role_policy" "secrets_policy" {
   })
 }
 
-# Policy ECR sempre aplicada (usa role existente ou novo) - CORREÇÃO PARA CannotPullContainerError
+# Cria política IAM para acesso ao ECR e CloudWatch Logs
+# Função: Permitir que tarefas ECS baixem imagens Docker do ECR e enviem logs
+# Usa: var.project_name, local.execution_role_name
+# Usado por: aws_ecs_service como dependência para garantir acesso ao ECR e logs
 resource "aws_iam_role_policy" "ecr_access" {
   name = "${var.project_name}-ecs-ecr-policy"
   role = local.execution_role_name
   
-  # Lifecycle para seguir filosofia "se existir usar, senão criar"
   lifecycle {
     create_before_destroy = true
   }
@@ -227,6 +257,10 @@ resource "aws_iam_role_policy" "ecr_access" {
   })
 }
 
+# Cria log groups CloudWatch para serviços ECS se não existirem
+# Função: Fornecer destino para logs dos containers com retenção de 7 dias
+# Usa: var.services, local.should_use_existing_log_groups, var.project_name, var.environment
+# Usado por: aws_ecs_task_definition para configurar log driver dos containers
 resource "aws_cloudwatch_log_group" "services" {
   for_each = {
     for k, v in var.services : k => v if !local.should_use_existing_log_groups[k]
@@ -243,6 +277,10 @@ resource "aws_cloudwatch_log_group" "services" {
   }
 }
 
+# Cria task definitions ECS para serviços se não existirem
+# Função: Definir configuração de containers (CPU, memória, imagem, variáveis, secrets)
+# Usa: var.services, local.should_use_existing_task_definitions, var.project_name, var.frontend_image_uri, var.api_image_uris, var.secrets_arns, var.environment, var.log_level, var.aws_region
+# Usado por: aws_ecs_service para especificar qual task definition executar
 resource "aws_ecs_task_definition" "services" {
   for_each = {
     for k, v in var.services : k => v if !local.should_use_existing_task_definitions[k]
@@ -314,6 +352,10 @@ resource "aws_ecs_task_definition" "services" {
   }
 }
 
+# Cria serviços ECS para executar containers se não existirem
+# Função: Executar e manter containers rodando com configuração de rede e load balancer
+# Usa: var.services, local.should_use_existing_services, var.project_name, local.cluster_arn, var.frontend_desired_count, var.api_desired_count, var.public_subnet_ids, var.private_subnet_ids, var.ecs_security_group_id, var.frontend_target_group_arn, var.api_target_group_arns
+# Usado por: Load balancer para direcionar tráfego aos containers em execução
 resource "aws_ecs_service" "services" {
   for_each = {
     for k, v in var.services : k => v if !local.should_use_existing_services[k]
@@ -326,13 +368,10 @@ resource "aws_ecs_service" "services" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    # CORREÇÃO: Sempre usar subnets públicas com IP público para evitar problemas de conectividade
-    # com Secrets Manager, ECR e outros serviços AWS quando não há NAT Gateway
     subnets = var.force_network_fix || var.use_public_subnets_for_ecs ? var.public_subnet_ids : (
       var.existing_resources.vpc_exists ? var.public_subnet_ids : var.private_subnet_ids
     )
     security_groups = [var.ecs_security_group_id]
-    # CORREÇÃO: Sempre habilitar IP público para garantir conectividade com serviços AWS
     assign_public_ip = var.force_network_fix || var.ecs_assign_public_ip || var.existing_resources.vpc_exists
   }
 
